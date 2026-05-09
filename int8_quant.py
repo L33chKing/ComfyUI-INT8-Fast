@@ -573,7 +573,8 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
 
                 # 5. Re-quantize back to INT8 using the original scale
                 patched_weight_int8 = quantize_int8(patched_weight_float, scale) #stochastic_round_int8_delta(patched_weight_float, scale) 
-                #I'm not really sure whether to stochastic round or not, results seem to depend on a per-lora basis.
+                # I'm not really sure whether to stochastic round or not, results seem to depend on a per-lora basis.
+                # If quality is of the utmost importance, I recommend Pre-Lora instead of worrying about this.
 
                 # 6. Move back to original device and store
                 patched_weight_int8 = patched_weight_int8.to(weight_int8.device)

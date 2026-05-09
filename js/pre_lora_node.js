@@ -59,7 +59,7 @@ app.registerExtension({
 									
 									const sz = this.computeSize();
 									this.size[0] = Math.max(this.size[0], sz[0]);
-									this.size[1] = Math.max(this.size[1], sz[1]);
+									this.size[1] = sz[1];
 									this.setDirtyCanvas(true, true);
 								}
 							});

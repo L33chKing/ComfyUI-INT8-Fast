@@ -5,6 +5,7 @@ We capture the latents per step, and measure how much they diverge from the BF16
 
 In this table, we compare the quality of our various lora approaches, against a standard bf16 lora loader baseline.
 The TLDR is that Pre-Lora is within marging of error of Dynamic Lora. Post-Lora is slightly worse. GGUF Q8 dequantizes to bf16 during inference to apply the lora math which is both slow and cheating.
+
 Anima:
 
 | Metric | INT8 ConvRot Pre-Lora | INT8 ConvRot Dynamic Lora | INT8 ConvRot Post-Lora | GGUF Q8_0 Lora | FP8 Lora |

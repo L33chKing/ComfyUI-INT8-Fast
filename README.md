@@ -3,6 +3,8 @@
 This node speeds up Flux2, Chroma, Z-Image, Ernie Image in ComfyUI by using INT8 quantization, delivering between 1.5~2x faster inference on my 3090 depending on the model. It should work on any NVIDIA GPU with enough INT8 TOPS. It's unlikely to be faster than proper FP8 on 40-Series and above. 
 Works with lora, torch compile (needed to get full speedup).
 
+---
+
 Updates:
 
 2026-10-05:
@@ -15,7 +17,7 @@ Added Pre-Lora noded, which you can connect to the INT8 Model loader to merge lo
 
 For more info on quality of convrot, lora approaches see the Metrics.md
 
-
+---
 
 Pre-quantized checkpoints were recommended for most architectures, but on-the-fly quantization with ConvRot is better in all cases.
 However, ConvRot is also a little slower, so these prequantized models are still useful.

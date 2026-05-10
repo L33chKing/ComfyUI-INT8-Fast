@@ -15,7 +15,7 @@ Converted QuaRot to ConvRot, which is a small but free quality gain.
 
 Added Pre-Lora node, which you can connect to the INT8 Model loader to merge loras before utilizing on the fly quantization. 
 
-For more info on quality of convrot, lora approaches see the Metrics.md
+For more info on quality of convrot, lora approaches see the [Metrics](Metrics.md)
 
 ---
 

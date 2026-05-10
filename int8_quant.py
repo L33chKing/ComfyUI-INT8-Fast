@@ -642,6 +642,32 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
         # --- NON-INT8 MODULE PATH ---
         return super().patch_weight_to_device(key, device_to, inplace_update)
 
+    def load(self, *args, **kwargs):
+        res = super().load(*args, **kwargs) if hasattr(super(), "load") else None
+        
+        device_to = kwargs.get("device_to", args[0] if len(args) > 0 else self.model.device)
+        
+        for name, module in self.model.named_modules():
+            if hasattr(module, "_is_quantized") and module._is_quantized:
+                weight_key = name + ".weight"
+                bias_key = name + ".bias"
+                
+                if weight_key in self.patches:
+                    if hasattr(module, "weight_lowvram_function"):
+                        module.weight_lowvram_function = None
+                    if hasattr(module, "weight_function"):
+                        module.weight_function = [f for f in getattr(module, "weight_function", []) if type(f).__name__ != "LowVramPatch"]
+                    self.patch_weight_to_device(weight_key, device_to=device_to)
+                    
+                if bias_key in self.patches:
+                    if hasattr(module, "bias_lowvram_function"):
+                        module.bias_lowvram_function = None
+                    if hasattr(module, "bias_function"):
+                        module.bias_function = [f for f in getattr(module, "bias_function", []) if type(f).__name__ != "LowVramPatch"]
+                    self.patch_weight_to_device(bias_key, device_to=device_to)
+                    
+        return res
+
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights:
             for name, module in self.model.named_modules():
@@ -651,8 +677,17 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
 
     def clone(self, *args, **kwargs):
         src_cls = self.__class__
-        self.__class__ = INT8ModelPatcher
+        
+        if src_cls is INT8ModelPatcher:
+            return super().clone(*args, **kwargs)
+            
+        if not issubclass(src_cls, INT8ModelPatcher):
+            name = f"INT8_{src_cls.__name__}"
+            dynamic_cls = type(name, (INT8ModelPatcher, src_cls), {})
+        else:
+            dynamic_cls = src_cls
+            
+        self.__class__ = dynamic_cls
         n = super().clone(*args, **kwargs)
-        n.__class__ = INT8ModelPatcher
         self.__class__ = src_cls
         return n

@@ -688,6 +688,21 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
             dynamic_cls = src_cls
             
         self.__class__ = dynamic_cls
+        
+        # Provide a fallback for non-dynamic delegates (e.g. for KJNodes)
+        if getattr(self, "cached_patcher_init", None) is None:
+            self.cached_patcher_init = (lambda *a, **kw: self, ())
+            
         n = super().clone(*args, **kwargs)
+        
+        # If disable_dynamic is True, the core strips dynamic wrappers. We must re-apply INT8!
+        disable_dyn = kwargs.get("disable_dynamic", False)
+        if len(args) > 0:
+            disable_dyn = args[0]
+            
+        if disable_dyn and not issubclass(n.__class__, INT8ModelPatcher):
+            new_cls = type(f"INT8_{n.__class__.__name__}", (INT8ModelPatcher, n.__class__), {})
+            n.__class__ = new_cls
+
         self.__class__ = src_cls
         return n

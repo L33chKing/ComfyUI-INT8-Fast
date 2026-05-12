@@ -95,7 +95,7 @@ class UNetLoaderINTW8A8:
             ]
         elif model_type == "hidream o1":
             Int8TensorwiseOps.excluded_names = [
-                'embed', 'language_model.layers.35.mlp', #'deepstack', 'merger', 'language_model.layers.0.', 'language_model.layers.1.',
+                'embed', 'language_model.layers.35.mlp',
             ]
         elif model_type == "wan":
             Int8TensorwiseOps.excluded_names = [

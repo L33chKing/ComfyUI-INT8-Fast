@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+import logging
 import comfy.model_patcher
 import comfy.lora
 import comfy.utils
@@ -146,6 +147,7 @@ if _COMFY_OPS_AVAILABLE:
         enable_convrot = False # Toggle for ConvRot Hadamard rotation
         use_triton = True  # Toggle for Triton fused kernel (mirrors _use_triton)
         _is_prequantized = False # Keep this as a status flag, but don't use for detection
+        lora_mode = "None" # None/Stochastic bake into INT8 weights; Dynamic applies LoRA at inference
         dynamic_lora = False # If True, apply LoRA dynamically at inference; if False, bake into INT8 weights at load time
         lora_patches = {} # Map of model_key -> patch list (from load_lora)
         lora_strength = 1.0
@@ -164,18 +166,91 @@ if _COMFY_OPS_AVAILABLE:
             
             def reset_parameters(self):
                 return None
+
+            @staticmethod
+            def _normalize_lora_key(key):
+                if not isinstance(key, str):
+                    return key
+                for p in ["diffusion_model.", "model.diffusion_model.", "model.", "transformer."]:
+                    if key.startswith(p):
+                        return key[len(p):]
+                return key
+
+            @staticmethod
+            def _format_lora_patches(patches):
+                formatted = []
+                for patch in patches or []:
+                    if len(patch) == 4:
+                        v, offset, function, strength = patch
+                    else:
+                        v, offset, function = patch
+                        strength = getattr(Int8TensorwiseOps, "lora_strength", 1.0)
+                    formatted.append((strength, v, 1.0, offset, function))
+                return formatted
+
+            def _apply_int8_lora_patches(self, tensor, key, patches, device):
+                if not patches or tensor.dtype == torch.int8:
+                    return tensor
+
+                temp_dtype = comfy.model_management.lora_compute_dtype(device)
+                tensor_temp = tensor.to(device=device, dtype=temp_dtype, non_blocking=True)
+                return comfy.lora.calculate_weight(self._format_lora_patches(patches), tensor_temp, key)
+
+            def finalize_pending_int8(self):
+                pending = getattr(self, "_pending_int8_finalize", None)
+                if pending is None:
+                    return False
+
+                weight_key = pending["weight_key"]
+                device = pending.get("device")
+                if device is None:
+                    device = torch.device("cuda") if torch.cuda.is_available() else self.weight.device
+
+                weight_tensor = self.weight.detach()
+                weight_tensor = self._apply_int8_lora_patches(weight_tensor, weight_key, pending.get("lora_patches"), device)
+
+                if pending["quantize"]:
+                    if not hasattr(Int8TensorwiseOps, '_logged_otf'):
+                        print(f"INT8 Fast: Quantizing on-the-fly (ConvRot: {pending.get('enable_convrot', False)})")
+                        Int8TensorwiseOps._logged_otf = True
+
+                    w_gpu = weight_tensor.to(device, non_blocking=True).float()
+
+                    self._use_convrot = False
+                    if pending.get("enable_convrot", False) and self.in_features % CONVROT_GROUP_SIZE == 0:
+                        try:
+                            from .convrot import build_hadamard, rotate_weight
+                            H = build_hadamard(CONVROT_GROUP_SIZE, device=w_gpu.device, dtype=w_gpu.dtype)
+                            w_gpu = rotate_weight(w_gpu, H, group_size=CONVROT_GROUP_SIZE)
+                            self._use_convrot = True
+                        except ImportError as e:
+                            logging.warning(f"INT8 Fast: ConvRot enabled but convrot module error: {e}")
+
+                    q_weight, q_scale = quantize_int8_axiswise(w_gpu, dim=1)
+                    self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
+                    self.register_buffer('weight_scale', q_scale.cpu())
+                    self._weight_scale_scalar = None
+                    self._is_quantized = True
+                    self._is_per_row = True
+                    del w_gpu, q_weight, q_scale
+                else:
+                    self.weight = nn.Parameter(weight_tensor.cpu(), requires_grad=False)
+
+                self.weight_comfy_model_dtype = self.weight.dtype
+                if self.weight_scale is not None:
+                    self.weight_scale_comfy_model_dtype = self.weight_scale.dtype
+                if self.bias is not None:
+                    self.bias_comfy_model_dtype = self.bias.dtype
+
+                delattr(self, "_pending_int8_finalize")
+                return True
             
             def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
                 weight_key = prefix + "weight"
                 
                 # Utility to normalize keys by stripping common prefixes
                 def normalize_key(key):
-                    if not isinstance(key, str):
-                        return key
-                    for p in ["diffusion_model.", "model.diffusion_model.", "model.", "transformer."]:
-                        if key.startswith(p):
-                            return key[len(p):]
-                    return key
+                    return self._normalize_lora_key(key)
 
                 def apply_lora_patches(tensor, key):
                     if not Int8TensorwiseOps.lora_patches or tensor.dtype == torch.int8:
@@ -183,16 +258,6 @@ if _COMFY_OPS_AVAILABLE:
                     nk = normalize_key(key)
                     patches = Int8TensorwiseOps.lora_patches.get(nk)
                     if patches:
-                        # calculate_weight expects: [(strength, v, strength_model, offset, function)]
-                        formatted = []
-                        for patch in patches:
-                            if len(patch) == 4:
-                                v, offset, function, strength = patch
-                            else:
-                                v, offset, function = patch
-                                strength = getattr(Int8TensorwiseOps, "lora_strength", 1.0)
-                            formatted.append((strength, v, 1.0, offset, function))
-                        
                         # Track applied patches
                         if not hasattr(Int8TensorwiseOps, 'applied_lora_patches'):
                             Int8TensorwiseOps.applied_lora_patches = set()
@@ -208,10 +273,7 @@ if _COMFY_OPS_AVAILABLE:
                         device = getattr(Int8TensorwiseOps, "dynamic_load_device", None)
                         if device is None:
                             device = tensor.device
-                        temp_dtype = comfy.model_management.lora_compute_dtype(device)
-                        
-                        tensor_temp = tensor.to(device=device, dtype=temp_dtype, non_blocking=True)
-                        result_temp = comfy.lora.calculate_weight(formatted, tensor_temp, key)
+                        result_temp = self._apply_int8_lora_patches(tensor, key, patches, device)
                         return result_temp.to(tensor.dtype)
                     return tensor
 
@@ -259,8 +321,19 @@ if _COMFY_OPS_AVAILABLE:
                     except Exception:
                         pass
                 
-                # Apply LoRA patches to weight and bias once
-                if weight_tensor is not None:
+                pending_weight_lora_patches = None
+                if weight_tensor is not None and weight_tensor.dtype != torch.int8:
+                    pending_weight_lora_patches = Int8TensorwiseOps.lora_patches.get(normalize_key(weight_key))
+
+                defer_weight_lora = (
+                    getattr(Int8TensorwiseOps, "dynamic_load_device", None) is not None
+                    and pending_weight_lora_patches
+                )
+
+                # Apply LoRA patches to weight and bias once. With Aimdo, large
+                # weight patches are deferred until KSampler/model load time so
+                # the loader node stays cheap and VBAR geometry is finalized once.
+                if weight_tensor is not None and not defer_weight_lora:
                     weight_tensor = apply_lora_patches(weight_tensor, weight_key)
                 if bias_tensor is not None:
                     bias_tensor = apply_lora_patches(bias_tensor, bias_key)
@@ -295,8 +368,27 @@ if _COMFY_OPS_AVAILABLE:
                         # Load High-Precision
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
+                        should_quantize = not (is_excluded or is_dim1 or not Int8TensorwiseOps.dynamic_quantize)
+                        defer_finalize = (
+                            getattr(Int8TensorwiseOps, "dynamic_load_device", None) is not None
+                            and (should_quantize or pending_weight_lora_patches)
+                        )
                         
-                        if is_excluded or is_dim1 or not Int8TensorwiseOps.dynamic_quantize:
+                        if defer_finalize:
+                            self._is_quantized = False
+                            self.weight = nn.Parameter(source_tensor(weight_tensor), requires_grad=False)
+                            self._pending_int8_finalize = {
+                                "weight_key": weight_key,
+                                "quantize": should_quantize,
+                                "lora_patches": pending_weight_lora_patches,
+                                "device": getattr(Int8TensorwiseOps, "dynamic_load_device", None),
+                                "enable_convrot": getattr(Int8TensorwiseOps, "enable_convrot", False),
+                            }
+                            if pending_weight_lora_patches:
+                                if not hasattr(Int8TensorwiseOps, 'applied_lora_patches'):
+                                    Int8TensorwiseOps.applied_lora_patches = set()
+                                Int8TensorwiseOps.applied_lora_patches.add(normalize_key(weight_key))
+                        elif not should_quantize:
                             self._is_quantized = False
                             self.weight = nn.Parameter(source_tensor(weight_tensor), requires_grad=False)
                         else:
@@ -518,6 +610,18 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
     Routes patching through either a bake-in path (dequant-patch-requant)
     or a dynamic path (runtime injection), depending on the dynamic_lora toggle.
     """
+    def finalize_pending_int8(self):
+        finalized = 0
+        for module in self.model.modules():
+            finalize = getattr(module, "finalize_pending_int8", None)
+            if finalize is not None and finalize():
+                finalized += 1
+        if finalized > 0:
+            self.size = 0
+            logging.info(f"INT8 Fast: Finalized {finalized} deferred INT8 layer(s) at model load time.")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
         if key not in self.patches and not force_cast:
             return super().patch_weight_to_device(key, device_to, inplace_update, return_weight, force_cast)
@@ -586,9 +690,10 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
                     patched_weight_float = rotate_weight(patched_weight_float, H, group_size=group_size)
 
                 # 5. Re-quantize back to INT8 using the original scale
-                patched_weight_int8 = quantize_int8(patched_weight_float, scale) #stochastic_round_int8_delta(patched_weight_float, scale) 
-                # I'm not really sure whether to stochastic round or not, results seem to depend on a per-lora basis.
-                # If quality is of the utmost importance, I recommend Pre-Lora instead of worrying about this.
+                if getattr(Int8TensorwiseOps, "lora_mode", "None") == "Stochastic":
+                    patched_weight_int8 = stochastic_round_int8_delta(patched_weight_float, scale)
+                else:
+                    patched_weight_int8 = quantize_int8(patched_weight_float, scale)
 
                 # 6. Move back to original device and store
                 patched_weight_int8 = patched_weight_int8.to(current_weight.device)
@@ -659,6 +764,8 @@ class INT8ModelPatcher(comfy.model_patcher.ModelPatcher):
         return super().patch_weight_to_device(key, device_to, inplace_update, return_weight, force_cast)
 
     def load(self, *args, **kwargs):
+        self.finalize_pending_int8()
+
         # Cleanup: Revert any keys that are in backup but no longer in patches (stale patches)
         # This ensures that when a LoRA is disabled, the model returns to its base state.
         stale_keys = [k for k in self.backup if k not in self.patches]
